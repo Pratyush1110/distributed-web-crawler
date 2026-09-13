@@ -2,6 +2,7 @@ import "dotenv/config";
 import Fastify from "fastify";
 import { prisma } from "./lib/prisma.js";
 import { normalizeUrl } from "./lib/url.js";
+import { crawlQueue } from "./lib/queue.js";
 
 const app = Fastify({
   logger: true,
@@ -61,6 +62,12 @@ app.post("/crawl", async (request, reply) => {
       startUrl: normalizedStartUrl,
       maxDepth: body.maxDepth,
     },
+  });
+
+  await crawlQueue.add("crawl", {
+    crawlId: crawl.id,
+    url: normalizedStartUrl,
+    depth: 0,
   });
 
   return reply.status(201).send({
