@@ -1,6 +1,7 @@
 import "dotenv/config";
 import Fastify from "fastify";
 import { prisma } from "./lib/prisma.js";
+import { normalizeUrl } from "./lib/url.js";
 
 const app = Fastify({
   logger: true,
@@ -34,25 +35,30 @@ app.post("/crawl", async (request, reply) => {
     });
   }
 
-  let startUrl: URL;
+  let normalizedStartUrl: string;
 
   try {
-    startUrl = new URL(body.startUrl);
+    const parsedUrl = new URL(body.startUrl);
+
+    if (
+      parsedUrl.protocol !== "http:" &&
+      parsedUrl.protocol !== "https:"
+    ) {
+      return reply.status(400).send({
+        error: "startUrl must use HTTP or HTTPS",
+      });
+    }
+
+    normalizedStartUrl = normalizeUrl(body.startUrl);
   } catch {
     return reply.status(400).send({
       error: "startUrl must be a valid URL",
     });
   }
 
-  if (startUrl.protocol !== "http:" && startUrl.protocol !== "https:") {
-    return reply.status(400).send({
-      error: "startUrl must use HTTP or HTTPS",
-    });
-  }
-
   const crawl = await prisma.crawl.create({
     data: {
-      startUrl: startUrl.toString(),
+      startUrl: normalizedStartUrl,
       maxDepth: body.maxDepth,
     },
   });
