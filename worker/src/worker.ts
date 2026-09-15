@@ -1,0 +1,27 @@
+import "dotenv/config";
+import { Worker } from "bullmq";
+
+const redisConnection = {
+  host: process.env.REDIS_HOST ?? "localhost",
+  port: Number(process.env.REDIS_PORT ?? 6379),
+};
+
+const worker = new Worker(
+  "crawlQueue",
+  async (job) => {
+    console.log("Received job:", job.id, job.name, job.data);
+  },
+  {
+    connection: redisConnection,
+  },
+);
+
+worker.on("completed", (job) => {
+  console.log("Job completed:", job.id);
+});
+
+worker.on("failed", (job, error) => {
+  console.error("Job failed:", job?.id, error.message);
+});
+
+console.log("Crawler worker started");
