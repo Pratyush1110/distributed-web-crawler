@@ -1,0 +1,71 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum CrawlStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum UrlStatus {
+  PENDING
+  CRAWLING
+  CRAWLED
+  FAILED
+}
+
+model Crawl {
+  id        String      @id @default(uuid())
+  startUrl  String
+  status    CrawlStatus @default(PENDING)
+  maxDepth  Int         @default(0)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  urls      Url[]
+}
+
+model Url {
+  id            String       @id @default(uuid())
+  crawlId       String
+  url           String
+  normalizedUrl String
+  status        UrlStatus    @default(PENDING)
+  depth         Int          @default(0)
+  discoveredAt  DateTime     @default(now())
+  crawledAt     DateTime?
+  crawl         Crawl        @relation(fields: [crawlId], references: [id])
+  page          Page?
+  errors        CrawlError[]
+
+  @@unique([crawlId, normalizedUrl])
+  @@index([crawlId, status])
+}
+
+model Page {
+  id          String   @id @default(uuid())
+  urlId       String   @unique
+  statusCode  Int
+  title       String?
+  content     String
+  contentType String?
+  fetchedAt   DateTime @default(now())
+  url         Url      @relation(fields: [urlId], references: [id])
+}
+
+model CrawlError {
+  id        String   @id @default(uuid())
+  urlId     String
+  error     String
+  createdAt DateTime @default(now())
+  url       Url      @relation(fields: [urlId], references: [id])
+
+  @@index([urlId])
+}
