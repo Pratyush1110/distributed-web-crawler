@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { Worker } from "bullmq";
+import { fetchUrl } from "./lib/http.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
@@ -10,6 +11,15 @@ const worker = new Worker(
   "crawlQueue",
   async (job) => {
     console.log("Received job:", job.id, job.name, job.data);
+
+    const result = await fetchUrl(job.data.url);
+
+    console.log("Fetched URL:", {
+        url: job.data.url,
+        statusCode: result.statusCode,
+        contentType: result.contentType,
+        bodyLength: result.body.length,
+    });
   },
   {
     connection: redisConnection,
