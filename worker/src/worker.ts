@@ -4,6 +4,7 @@ import { fetchUrl } from "./lib/http.js";
 import { parseHtml } from "./lib/html.js";
 import { prisma } from "./lib/prisma.js";
 import { registerUrl } from "./lib/url.js";
+import { getCrawlMaxDepth } from "./lib/crawl.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
@@ -24,6 +25,16 @@ const worker = new Worker(
     if (!registration.created) {
       console.log("Skipping duplicate URL:", job.data.url);
       return;
+    }
+
+    const maxDepth = await getCrawlMaxDepth(job.data.crawlId);
+
+    if (job.data.depth >= maxDepth) {
+      console.log("Maximum depth reached:", {
+        url: job.data.url,
+        depth: job.data.depth,
+        maxDepth,
+      });
     }
 
     const result = await fetchUrl(job.data.url);
