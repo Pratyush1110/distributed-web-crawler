@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { Worker } from "bullmq";
 import { fetchUrl } from "./lib/http.js";
+import { parseHtml } from "./lib/html.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
@@ -15,11 +16,15 @@ const worker = new Worker(
     const result = await fetchUrl(job.data.url);
 
     console.log("Fetched URL:", {
-        url: job.data.url,
-        statusCode: result.statusCode,
-        contentType: result.contentType,
-        bodyLength: result.body.length,
+      url: job.data.url,
+      statusCode: result.statusCode,
+      contentType: result.contentType,
+      bodyLength: result.body.length,
     });
+
+    const $ = parseHtml(result.body);
+
+    console.log("Page title:", $("title").text());
   },
   {
     connection: redisConnection,
