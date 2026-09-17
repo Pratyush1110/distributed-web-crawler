@@ -8,6 +8,7 @@ import { getCrawlMaxDepth } from "./lib/crawl.js";
 import { extractLinks } from "./lib/links.js";
 import { resolveAndNormalizeUrl } from "./lib/discovery.js";
 import { crawlQueue } from "./lib/queue.js";
+import { waitForRateLimit } from "./lib/rate-limit.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
@@ -41,6 +42,8 @@ const worker = new Worker(
         maxDepth,
       });
     }
+
+    await waitForRateLimit(job.data.url);
 
     const result = await fetchUrl(job.data.url);
 
