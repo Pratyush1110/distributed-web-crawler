@@ -9,6 +9,11 @@ import { extractLinks } from "./lib/links.js";
 import { resolveAndNormalizeUrl } from "./lib/discovery.js";
 import { crawlQueue } from "./lib/queue.js";
 import { waitForRateLimit } from "./lib/rate-limit.js";
+import {
+  CRAWLER_USER_AGENT,
+  getRobotsRules,
+} from "./lib/robots.js";
+import { isUrlAllowed } from "./lib/robots-parser.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
@@ -43,9 +48,22 @@ const worker = new Worker(
       });
     }
 
+    const robotsRules = await getRobotsRules(job.data.url);
+
+    if (!isUrlAllowed(job.data.url, robotsRules)) {
+      console.log("Blocked by robots.txt:", {
+        url: job.data.url,
+        userAgent: CRAWLER_USER_AGENT,
+      });
+
+      return;
+    }
+
     await waitForRateLimit(job.data.url);
 
-    const result = await fetchUrl(job.data.url);
+    const result = await fetchUrl(job.data.url, {
+      userAgent: CRAWLER_USER_AGENT,
+    });
 
     console.log("Fetched URL:", {
       url: job.data.url,
