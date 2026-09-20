@@ -14,6 +14,10 @@ import {
   getRobotsRules,
 } from "./lib/robots.js";
 import { isUrlAllowed } from "./lib/robots-parser.js";
+import {
+  isTransientError,
+  retryWithBackoff,
+} from "./lib/retry.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
@@ -61,9 +65,28 @@ const worker = new Worker(
 
     await waitForRateLimit(job.data.url);
 
-    const result = await fetchUrl(job.data.url, {
-      userAgent: CRAWLER_USER_AGENT,
-    });
+    const result = await retryWithBackoff(
+      () =>
+        fetchUrl(job.data.url, {
+          userAgent: CRAWLER_USER_AGENT,
+        }),
+      isTransientError,
+      3,
+      ({ attempt, nextAttempt, delayMs, error }) => {
+        console.log("Retrying crawl request:", {
+          crawlId: job.data.crawlId,
+          jobId: job.id,
+          url: job.data.url,
+          attempt,
+          nextAttempt,
+          delayMs,
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+        });
+      },
+    );
 
     console.log("Fetched URL:", {
       url: job.data.url,
