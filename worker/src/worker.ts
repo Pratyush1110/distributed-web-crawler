@@ -14,10 +14,8 @@ import {
   getRobotsRules,
 } from "./lib/robots.js";
 import { isUrlAllowed } from "./lib/robots-parser.js";
-import {
-  isTransientError,
-  retryWithBackoff,
-} from "./lib/retry.js";
+import { isTransientError } from "./lib/retry.js";
+import { crawlDLQ } from "./lib/dlq.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
@@ -65,28 +63,52 @@ const worker = new Worker(
 
     await waitForRateLimit(job.data.url);
 
-    const result = await retryWithBackoff(
-      () =>
-        fetchUrl(job.data.url, {
-          userAgent: CRAWLER_USER_AGENT,
-        }),
-      isTransientError,
-      3,
-      ({ attempt, nextAttempt, delayMs, error }) => {
-        console.log("Retrying crawl request:", {
+    let result;
+
+    try {
+      result = await fetchUrl(job.data.url, {
+        userAgent: CRAWLER_USER_AGENT,
+      });
+    } catch (error) {
+      const transient = isTransientError(error);
+      const maxAttempts = job.opts.attempts ?? 1;
+      const currentAttempt = job.attemptsMade + 1;
+      const finalAttempt = currentAttempt >= maxAttempts;
+
+      if (!transient || finalAttempt) {
+        await crawlDLQ.add("crawl-failed", {
           crawlId: job.data.crawlId,
+          jobId: String(job.id),
+          url: job.data.url,
+          depth: job.data.depth,
+          attempts: currentAttempt,
+          error: {
+            name:
+              error instanceof Error
+                ? error.name
+                : "UnknownError",
+            message:
+              error instanceof Error
+                ? error.message
+                : String(error),
+          },
+          failedAt: new Date().toISOString(),
+        });
+
+        console.error("Job moved to DLQ:", {
           jobId: job.id,
           url: job.data.url,
-          attempt,
-          nextAttempt,
-          delayMs,
-          error:
-            error instanceof Error
-              ? error.message
-              : String(error),
+          attempts: currentAttempt,
+          transient,
         });
-      },
-    );
+      }
+
+      if (!transient) {
+        return;
+      }
+
+      throw error;
+    }
 
     console.log("Fetched URL:", {
       url: job.data.url,
