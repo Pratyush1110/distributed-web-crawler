@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Worker } from "bullmq";
+import { UnrecoverableError, Worker } from "bullmq";
 import { fetchUrl } from "./lib/http.js";
 import { parseHtml } from "./lib/html.js";
 import { prisma } from "./lib/prisma.js";
@@ -16,6 +16,7 @@ import {
 import { isUrlAllowed } from "./lib/robots-parser.js";
 import { isTransientError } from "./lib/retry.js";
 import { crawlDLQ } from "./lib/dlq.js";
+import { updateCrawlStatusIfFinished } from "./lib/crawl-status.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
@@ -27,6 +28,16 @@ const worker = new Worker(
   async (job) => {
     console.log("Received job:", job.id, job.name, job.data);
 
+    await prisma.crawl.updateMany({
+      where: {
+        id: job.data.crawlId,
+        status: "PENDING",
+      },
+      data: {
+        status: "RUNNING",
+      },
+    });
+
     if (!job.data.registered) {
       const registration = await registerUrl(
         job.data.crawlId,
@@ -34,11 +45,45 @@ const worker = new Worker(
         job.data.depth,
       );
 
-      if (!registration.created) {
-        console.log("Skipping duplicate URL:", job.data.url);
+      if (registration.crawlTerminal) {
+        console.log("Skipping job for terminal crawl:", {
+          crawlId: job.data.crawlId,
+          url: job.data.url,
+        });
         return;
       }
+
+      if (!registration.created) {
+        const existingUrl = await prisma.url.findUnique({
+          where: {
+            crawlId_normalizedUrl: {
+              crawlId: job.data.crawlId,
+              normalizedUrl: job.data.url,
+            },
+          },
+          select: {
+            status: true,
+          },
+        });
+
+        if (!existingUrl || existingUrl.status === "CRAWLED") {
+          console.log("Skipping duplicate URL:", job.data.url);
+          return;
+        }
+
+        console.log("Retrying existing URL:", job.data.url);
+      }
     }
+
+    await prisma.url.updateMany({
+      where: {
+        crawlId: job.data.crawlId,
+        normalizedUrl: job.data.url,
+      },
+      data: {
+        status: "CRAWLING",
+      },
+    });
 
     const maxDepth = await getCrawlMaxDepth(job.data.crawlId);
 
@@ -53,10 +98,22 @@ const worker = new Worker(
     const robotsRules = await getRobotsRules(job.data.url);
 
     if (!isUrlAllowed(job.data.url, robotsRules)) {
+      await prisma.url.updateMany({
+        where: {
+          crawlId: job.data.crawlId,
+          normalizedUrl: job.data.url,
+        },
+        data: {
+          status: "FAILED",
+        },
+      });
+
       console.log("Blocked by robots.txt:", {
         url: job.data.url,
         userAgent: CRAWLER_USER_AGENT,
       });
+
+      await updateCrawlStatusIfFinished(job.data.crawlId);
 
       return;
     }
@@ -69,42 +126,69 @@ const worker = new Worker(
       result = await fetchUrl(job.data.url, {
         userAgent: CRAWLER_USER_AGENT,
       });
+
     } catch (error) {
       const transient = isTransientError(error);
       const maxAttempts = job.opts.attempts ?? 1;
       const currentAttempt = job.attemptsMade + 1;
       const finalAttempt = currentAttempt >= maxAttempts;
+      const terminalFailure = !transient || finalAttempt;
 
-      if (!transient || finalAttempt) {
-        await crawlDLQ.add("crawl-failed", {
-          crawlId: job.data.crawlId,
-          jobId: String(job.id),
-          url: job.data.url,
-          depth: job.data.depth,
-          attempts: currentAttempt,
-          error: {
-            name:
-              error instanceof Error
-                ? error.name
-                : "UnknownError",
-            message:
-              error instanceof Error
-                ? error.message
-                : String(error),
+      if (terminalFailure) {
+        const updateResult = await prisma.url.updateMany({
+          where: {
+            crawlId: job.data.crawlId,
+            normalizedUrl: job.data.url,
           },
-          failedAt: new Date().toISOString(),
+          data: {
+            status: "FAILED",
+          },
         });
 
-        console.error("Job moved to DLQ:", {
-          jobId: job.id,
+        console.log("URL marked as failed:", {
           url: job.data.url,
-          attempts: currentAttempt,
+          updatedCount: updateResult.count,
           transient,
+          finalAttempt,
         });
+
+        try {
+          await crawlDLQ.add("crawl-failed", {
+            crawlId: job.data.crawlId,
+            jobId: String(job.id),
+            url: job.data.url,
+            depth: job.data.depth,
+            attempts: currentAttempt,
+            error: {
+              name:
+                error instanceof Error
+                  ? error.name
+                  : "UnknownError",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : String(error),
+            },
+            failedAt: new Date().toISOString(),
+          });
+
+          console.log("Job moved to DLQ:", {
+            jobId: job.id,
+            url: job.data.url,
+            attempts: currentAttempt,
+            transient,
+          });
+        } catch (dlqError) {
+          console.error("Failed to add job to DLQ:", dlqError);
+        }
       }
 
-      if (!transient) {
-        return;
+      if (terminalFailure) {
+        await updateCrawlStatusIfFinished(job.data.crawlId);
+
+        throw new UnrecoverableError(
+          error instanceof Error ? error.message : String(error),
+        );
       }
 
       throw error;
@@ -118,10 +202,63 @@ const worker = new Worker(
     });
 
     const $ = parseHtml(result.body);
+    const title = $("title").text() || null;
 
-    console.log("Page title:", $("title").text());
+    const urlRecord = await prisma.url.findUnique({
+      where: {
+        crawlId_normalizedUrl: {
+          crawlId: job.data.crawlId,
+          normalizedUrl: job.data.url,
+        },
+      },
+      select: {
+        id: true,
+      },
+    });
+
+    if (!urlRecord) {
+      throw new Error(`URL record not found: ${job.data.url}`);
+    }
+
+    await prisma.$transaction([
+      prisma.page.upsert({
+        where: {
+          urlId: urlRecord.id,
+        },
+        create: {
+          urlId: urlRecord.id,
+          statusCode: result.statusCode,
+          title,
+          content: result.body,
+          contentType: result.contentType,
+        },
+        update: {
+          statusCode: result.statusCode,
+          title,
+          content: result.body,
+          contentType: result.contentType,
+          fetchedAt: new Date(),
+        },
+      }),
+    ]);
+
+    console.log("Page saved:", {
+      url: job.data.url,
+      title,
+    });
 
     if (job.data.depth >= maxDepth) {
+      await prisma.url.update({
+        where: {
+          id: urlRecord.id,
+        },
+        data: {
+          status: "CRAWLED",
+          crawledAt: new Date(),
+        },
+      });
+
+      await updateCrawlStatusIfFinished(job.data.crawlId);
       return;
     }
 
@@ -145,6 +282,14 @@ const worker = new Worker(
         job.data.depth + 1,
       );
 
+      if (registration.crawlTerminal) {
+        console.log("Stopping discovery for terminal crawl:", {
+          crawlId: job.data.crawlId,
+          url: normalizedUrl,
+        });
+        break;
+      }
+
       if (!registration.created) {
         console.log("Skipping duplicate discovered URL:", normalizedUrl);
         continue;
@@ -162,6 +307,18 @@ const worker = new Worker(
         depth: job.data.depth + 1,
       });
     }
+
+    await prisma.url.update({
+      where: {
+        id: urlRecord.id,
+      },
+      data: {
+        status: "CRAWLED",
+        crawledAt: new Date(),
+      },
+    });
+
+    await updateCrawlStatusIfFinished(job.data.crawlId);
   },
   {
     connection: redisConnection,

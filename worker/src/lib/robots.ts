@@ -26,24 +26,32 @@ function getRobotsCacheKey(url: string): string {
   return `robots:${parsedUrl.protocol}//${parsedUrl.host}`;
 }
 
+
 export async function fetchRobotsTxt(url: string): Promise<string | null> {
   const robotsUrl = getRobotsUrl(url);
 
-  const response = await fetchUrl(robotsUrl, {
-    userAgent: CRAWLER_USER_AGENT,
-  });
+  try {
+    const response = await fetchUrl(robotsUrl, {
+      userAgent: CRAWLER_USER_AGENT,
+    });
 
-  if (response.statusCode === 404) {
-    return null;
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw new Error(
+        `Failed to fetch robots.txt: ${response.statusCode}`,
+      );
+    }
+
+    return response.body;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "HTTP request failed with status 404"
+    ) {
+      return null;
+    }
+
+    throw error;
   }
-
-  if (response.statusCode < 200 || response.statusCode >= 300) {
-    throw new Error(
-      `Failed to fetch robots.txt: ${response.statusCode}`,
-    );
-  }
-
-  return response.body;
 }
 
 export async function getRobotsRules(

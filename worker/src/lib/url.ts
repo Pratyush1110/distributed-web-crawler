@@ -1,3 +1,4 @@
+
 import { prisma } from "./prisma.js";
 
 export async function registerUrl(
@@ -6,19 +7,48 @@ export async function registerUrl(
   depth: number,
 ) {
   try {
-    const url = await prisma.url.create({
-      data: {
-        crawlId,
-        url: normalizedUrl,
-        normalizedUrl,
-        depth,
-      },
-    });
+    return await prisma.$transaction(async (tx) => {
+      const crawls = await tx.$queryRaw<
+        Array<{ id: string; status: string }>
+      >`
+        SELECT "id", "status"
+        FROM "Crawl"
+        WHERE "id" = ${crawlId}
+        FOR UPDATE
+      `;
 
-    return {
-      created: true,
-      url,
-    };
+      const crawl = crawls[0];
+
+      if (!crawl) {
+        throw new Error(`Crawl not found: ${crawlId}`);
+      }
+
+      if (
+        crawl.status === "COMPLETED" ||
+        crawl.status === "FAILED"
+      ) {
+        return {
+          created: false,
+          url: null,
+          crawlTerminal: true,
+        };
+      }
+
+      const url = await tx.url.create({
+        data: {
+          crawlId,
+          url: normalizedUrl,
+          normalizedUrl,
+          depth,
+        },
+      });
+
+      return {
+        created: true,
+        url,
+        crawlTerminal: false,
+      };
+    });
   } catch (error: unknown) {
     if (
       error &&
@@ -29,6 +59,7 @@ export async function registerUrl(
       return {
         created: false,
         url: null,
+        crawlTerminal: false,
       };
     }
 

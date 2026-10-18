@@ -76,6 +76,54 @@ app.post("/crawl", async (request, reply) => {
   });
 });
 
+app.get("/crawl/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+
+  const crawl = await prisma.crawl.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      status: true,
+      urls: {
+        select: {
+          status: true,
+          page: {
+            select: {
+              id: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!crawl) {
+    return reply.status(404).send({
+      error: "Crawl not found",
+    });
+  }
+
+  const pagesCrawled = crawl.urls.filter(
+    (url) => url.page !== null,
+  ).length;
+
+  const pagesQueued = crawl.urls.filter(
+    (url) => url.status === "PENDING",
+  ).length;
+
+  const pagesFailed = crawl.urls.filter(
+    (url) => url.status === "FAILED",
+  ).length;
+
+  return reply.send({
+    crawlId: crawl.id,
+    status: crawl.status.toLowerCase(),
+    pagesCrawled,
+    pagesQueued,
+    pagesFailed,
+  });
+});
+
 const start = async () => {
   try {
     await app.listen({
