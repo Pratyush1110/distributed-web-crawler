@@ -55,3 +55,7 @@ export async function waitForRateLimit(
 
   return waitForRateLimit(url, requestsPerSecond);
 }
+
+export async function closeRateLimitRedis(): Promise<void> {
+  await redis.quit();
+}

@@ -8,10 +8,11 @@ import { getCrawlMaxDepth } from "./lib/crawl.js";
 import { extractLinks } from "./lib/links.js";
 import { resolveAndNormalizeUrl } from "./lib/discovery.js";
 import { crawlQueue } from "./lib/queue.js";
-import { waitForRateLimit } from "./lib/rate-limit.js";
+import { waitForRateLimit, closeRateLimitRedis } from "./lib/rate-limit.js";
 import {
   CRAWLER_USER_AGENT,
   getRobotsRules,
+  closeRobotsRedis
 } from "./lib/robots.js";
 import { isUrlAllowed } from "./lib/robots-parser.js";
 import { isTransientError } from "./lib/retry.js";
@@ -334,3 +335,53 @@ worker.on("failed", (job, error) => {
 });
 
 console.log("Crawler worker started");
+
+let isShuttingDown = false;
+
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  if (isShuttingDown) {
+    return;
+  }
+
+  isShuttingDown = true;
+  console.log(`Received ${signal}. Starting graceful shutdown...`);
+
+  try {
+    await worker.close();
+    console.log("Worker closed.");
+  } catch (error) {
+    console.error("Error closing worker:", error);
+    process.exitCode = 1;
+  }
+
+  try {
+    await Promise.all([
+      crawlQueue.close(),
+      crawlDLQ.close(),
+      closeRateLimitRedis(),
+      closeRobotsRedis(),
+    ]);
+    console.log("Redis connections and queues closed.");
+  } catch (error) {
+    console.error("Error closing Redis queues:", error);
+    process.exitCode = 1;
+  }
+
+  try {
+    await prisma.$disconnect();
+    console.log("Database connection closed.");
+  } catch (error) {
+    console.error("Error disconnecting Prisma:", error);
+    process.exitCode = 1;
+  }
+
+  console.log("Graceful shutdown complete.");
+}
+
+process.once("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
+
+process.once("SIGINT", () => {
+  void shutdown("SIGINT");
+});

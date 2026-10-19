@@ -80,3 +80,7 @@ export async function getRobotsRules(
 
   return rules;
 }
+
+export async function closeRobotsRedis(): Promise<void> {
+  await redis.quit();
+}

@@ -24,6 +24,10 @@ Crawling looks simple until several workers hit the same sites at once. This pro
 - **Failure handling:** transient vs. permanent error classification, bounded retries with exponential backoff, and a dead-letter queue.
 - **Clean service boundaries:** a thin HTTP API that only validates and enqueues, and stateless workers that do the heavy lifting.
 
+## Project status
+
+Working MVP. The core crawl pipeline is implemented end to end: queueing, deduplication, depth-limited recursion, `robots.txt`, per-domain rate limiting, retries, a dead-letter queue, and a status API. It has not yet been hardened for untrusted input or production deployment. The main gaps are SSRF protection, request timeouts, and graceful shutdown; see [Planned work](#planned-work).
+
 ## Architecture
 
 ### System overview
@@ -299,6 +303,8 @@ curl http://127.0.0.1:3000/crawl/<crawlId>
 | `POST` | `/crawl` | Start a crawl. `startUrl` must be `http`/`https`; `maxDepth` must be an integer ≥ 0. Invalid input returns `400`. |
 | `GET` | `/crawl/:id` | Status (`pending`, `running`, `completed`, `failed`) plus crawled/queued/failed counts. Unknown IDs return `404`. |
 
+Progress counts are read from PostgreSQL at request time while workers keep writing, so they are eventually consistent: a response is a snapshot and can lag in-flight work. `pagesQueued` counts URLs that are registered but not yet picked up (`PENDING`), not URLs currently being fetched.
+
 For a production-style worker run:
 
 ```bash
@@ -324,18 +330,38 @@ api/       Fastify server, Prisma schema and migrations, BullMQ producer
 worker/    BullMQ worker: robots.txt, rate limiting, fetch, retry, DLQ, link discovery
 ```
 
-## Roadmap
+## Planned work
 
-Known gaps in the current MVP, roughly in priority order:
+Current limitations and what's next, grouped by area.
 
-- [ ] Automated tests (unit tests for URL normalization, robots parsing, and retry classification; integration tests for the crawl lifecycle)
-- [ ] Docker Compose for one-command local setup
-- [ ] Endpoint to read crawled pages and results
-- [ ] DLQ consumer / replay tooling
-- [ ] Honor `Retry-After` on HTTP 429 (it's parsed into `HttpError` but not yet used for backoff)
-- [ ] Configurable worker concurrency (workers currently use BullMQ's default of one job at a time)
+**Reliability**
+- [ ] Graceful shutdown: on `SIGTERM`, stop taking jobs, finish the current one, then close Redis and PostgreSQL connections (workers currently have no signal handling)
+- [ ] Request timeouts and a maximum response size in the fetcher (neither is enforced today)
+- [ ] Explicit job IDs for idempotent enqueueing
+- [ ] Honor `Retry-After` on HTTP 429 (parsed into `HttpError`, not yet used for backoff)
+- [ ] Configurable worker concurrency (workers use BullMQ's default of one job at a time)
+- [ ] Write failure details to the `CrawlError` table (the model exists but isn't populated)
+- [ ] Documented failure tests: killed workers, Redis outage, slow or timing-out sites, duplicate crawl submissions
+
+**Observability**
+- [ ] Structured JSON logging (currently `console.log`)
+- [ ] Metrics: pages crawled, failures, queue depth, crawl latency, HTTP error rate, worker throughput
+
+**Security**
+- [ ] SSRF protection: the API accepts any `http`/`https` URL, so private, loopback, and link-local addresses (and redirects to them) must be blocked before this runs on untrusted input
+- [ ] API authentication and rate limiting
+- [ ] Upper bound on `maxDepth`
+
+**Features**
+- [ ] Search over crawled pages (PostgreSQL full-text search first)
+- [ ] Endpoint to read crawled pages
 - [ ] Content-type filtering so non-HTML responses aren't parsed as HTML
-- [ ] Write failure details to the `CrawlError` table (the model exists but isn't populated yet)
+- [ ] DLQ inspection and replay tooling
+
+**Deployment and quality**
+- [ ] Dockerfiles for the API and worker, plus Docker Compose for one-command startup
+- [ ] Load test with multiple workers against a large crawl
+- [ ] Automated tests: unit tests for URL normalization, robots parsing, and retry classification; integration tests for the crawl lifecycle
 
 ## Development
 
