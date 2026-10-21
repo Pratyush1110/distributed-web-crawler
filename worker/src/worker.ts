@@ -19,15 +19,29 @@ import { isTransientError } from "./lib/retry.js";
 import { crawlDLQ } from "./lib/dlq.js";
 import { updateCrawlStatusIfFinished } from "./lib/crawl-status.js";
 import { logger } from "./lib/logger.js";
+import {
+  pagesCrawledTotal,
+  crawlFailuresTotal,
+  httpRequestsTotal,
+  httpRequestDuration,
+  crawlJobDuration,
+} from "./lib/metrics.js";
+import {
+  startMetricsServer,
+  closeMetricsServer,
+} from "./lib/metrics-server.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
   port: Number(process.env.REDIS_PORT ?? 6379),
 };
 
+const jobStartTimes = new Map<string, number>();
+
 const worker = new Worker(
   "crawlQueue",
   async (job) => {
+    const jobStartedAt = performance.now();
     logger.info("job_received", {
       jobId: job.id,
       jobName: job.name,
@@ -140,7 +154,14 @@ const worker = new Worker(
         userAgent: CRAWLER_USER_AGENT,
       });
 
+      httpRequestsTotal.inc({ outcome: "success" });
+
     } catch (error) {
+      httpRequestDuration.observe(
+        (performance.now() - fetchStartedAt) / 1000,
+      );
+      httpRequestsTotal.inc({ outcome: "error" });
+
       const transient = isTransientError(error);
       const maxAttempts = job.opts.attempts ?? 1;
       const currentAttempt = job.attemptsMade + 1;
@@ -148,6 +169,8 @@ const worker = new Worker(
       const terminalFailure = !transient || finalAttempt;
 
       if (terminalFailure) {
+        crawlFailuresTotal.inc();
+
         const updateResult = await prisma.url.updateMany({
           where: {
             crawlId: job.data.crawlId,
@@ -212,6 +235,10 @@ const worker = new Worker(
       throw error;
     }
 
+    httpRequestDuration.observe(
+      (performance.now() - fetchStartedAt) / 1000,
+    );
+
     logger.info("url_fetched", {
       url: job.data.url,
       statusCode: result.statusCode,
@@ -265,6 +292,7 @@ const worker = new Worker(
       url: job.data.url,
       title,
     });
+    pagesCrawledTotal.inc();
 
     if (job.data.depth >= maxDepth) {
       await prisma.url.update({
@@ -349,19 +377,44 @@ const worker = new Worker(
   },
 );
 
+worker.on("active", (job) => {
+  jobStartTimes.set(String(job.id), performance.now());
+});
+
 worker.on("completed", (job) => {
+  const startedAt = jobStartTimes.get(String(job.id));
+
+  if (startedAt !== undefined) {
+    crawlJobDuration.observe(
+      (performance.now() - startedAt) / 1000,
+    );
+    jobStartTimes.delete(String(job.id));
+  }
+
   logger.info("job_completed", {
     jobId: job.id,
   });
 });
 
 worker.on("failed", (job, error) => {
+  if (job) {
+    const startedAt = jobStartTimes.get(String(job.id));
+
+    if (startedAt !== undefined) {
+      crawlJobDuration.observe(
+        (performance.now() - startedAt) / 1000,
+      );
+      jobStartTimes.delete(String(job.id));
+    }
+  }
+
   logger.error("job_failed", {
     jobId: job?.id,
     error: error.message,
   });
 });
 
+await startMetricsServer();
 logger.info("worker_started");
 
 let isShuttingDown = false;
@@ -379,6 +432,16 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
     logger.info("worker_closed");
   } catch (error) {
     logger.error("worker_close_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    process.exitCode = 1;
+  }
+
+  try {
+    await closeMetricsServer();
+    logger.info("metrics_server_closed");
+  } catch (error) {
+    logger.error("metrics_server_close_failed", {
       error: error instanceof Error ? error.message : String(error),
     });
     process.exitCode = 1;
