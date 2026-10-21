@@ -18,6 +18,7 @@ import { isUrlAllowed } from "./lib/robots-parser.js";
 import { isTransientError } from "./lib/retry.js";
 import { crawlDLQ } from "./lib/dlq.js";
 import { updateCrawlStatusIfFinished } from "./lib/crawl-status.js";
+import { logger } from "./lib/logger.js";
 
 const redisConnection = {
   host: process.env.REDIS_HOST ?? "localhost",
@@ -27,7 +28,13 @@ const redisConnection = {
 const worker = new Worker(
   "crawlQueue",
   async (job) => {
-    console.log("Received job:", job.id, job.name, job.data);
+    logger.info("job_received", {
+      jobId: job.id,
+      jobName: job.name,
+      crawlId: job.data.crawlId,
+      url: job.data.url,
+      depth: job.data.depth,
+    });
 
     await prisma.crawl.updateMany({
       where: {
@@ -47,7 +54,7 @@ const worker = new Worker(
       );
 
       if (registration.crawlTerminal) {
-        console.log("Skipping job for terminal crawl:", {
+        logger.info("job_skipped_terminal_crawl", {
           crawlId: job.data.crawlId,
           url: job.data.url,
         });
@@ -68,11 +75,15 @@ const worker = new Worker(
         });
 
         if (!existingUrl || existingUrl.status === "CRAWLED") {
-          console.log("Skipping duplicate URL:", job.data.url);
+          logger.info("duplicate_url_skipped", {
+            url: job.data.url,
+          });
           return;
         }
 
-        console.log("Retrying existing URL:", job.data.url);
+        logger.info("existing_url_retry", {
+          url: job.data.url,
+        });
       }
     }
 
@@ -89,7 +100,7 @@ const worker = new Worker(
     const maxDepth = await getCrawlMaxDepth(job.data.crawlId);
 
     if (job.data.depth >= maxDepth) {
-      console.log("Maximum depth reached:", {
+      logger.info("maximum_depth_reached", {
         url: job.data.url,
         depth: job.data.depth,
         maxDepth,
@@ -109,7 +120,7 @@ const worker = new Worker(
         },
       });
 
-      console.log("Blocked by robots.txt:", {
+      logger.warn("url_blocked_by_robots", {
         url: job.data.url,
         userAgent: CRAWLER_USER_AGENT,
       });
@@ -122,6 +133,7 @@ const worker = new Worker(
     await waitForRateLimit(job.data.url);
 
     let result;
+    const fetchStartedAt = performance.now();
 
     try {
       result = await fetchUrl(job.data.url, {
@@ -146,7 +158,7 @@ const worker = new Worker(
           },
         });
 
-        console.log("URL marked as failed:", {
+        logger.error("url_marked_failed", {
           url: job.data.url,
           updatedCount: updateResult.count,
           transient,
@@ -173,14 +185,19 @@ const worker = new Worker(
             failedAt: new Date().toISOString(),
           });
 
-          console.log("Job moved to DLQ:", {
+          logger.error("job_moved_to_dlq", {
             jobId: job.id,
             url: job.data.url,
             attempts: currentAttempt,
             transient,
           });
         } catch (dlqError) {
-          console.error("Failed to add job to DLQ:", dlqError);
+          logger.error("dlq_insertion_failed", {
+            error:
+              dlqError instanceof Error
+                ? dlqError.message
+                : String(dlqError),
+          });
         }
       }
 
@@ -195,11 +212,12 @@ const worker = new Worker(
       throw error;
     }
 
-    console.log("Fetched URL:", {
+    logger.info("url_fetched", {
       url: job.data.url,
       statusCode: result.statusCode,
       contentType: result.contentType,
       bodyLength: result.body.length,
+      latencyMs: Math.round(performance.now() - fetchStartedAt),
     });
 
     const $ = parseHtml(result.body);
@@ -243,7 +261,7 @@ const worker = new Worker(
       }),
     ]);
 
-    console.log("Page saved:", {
+    logger.info("page_saved", {
       url: job.data.url,
       title,
     });
@@ -265,7 +283,10 @@ const worker = new Worker(
 
     const links = extractLinks(result.body);
 
-    console.log("Extracted links:", links.length);
+    logger.info("links_extracted", {
+      url: job.data.url,
+      count: links.length,
+    });
 
     for (const href of links) {
       const normalizedUrl = resolveAndNormalizeUrl(
@@ -284,7 +305,7 @@ const worker = new Worker(
       );
 
       if (registration.crawlTerminal) {
-        console.log("Stopping discovery for terminal crawl:", {
+        logger.info("discovery_stopped_terminal_crawl", {
           crawlId: job.data.crawlId,
           url: normalizedUrl,
         });
@@ -292,7 +313,9 @@ const worker = new Worker(
       }
 
       if (!registration.created) {
-        console.log("Skipping duplicate discovered URL:", normalizedUrl);
+        logger.info("duplicate_discovered_url_skipped", {
+          url: normalizedUrl,
+        });
         continue;
       }
 
@@ -303,7 +326,7 @@ const worker = new Worker(
         registered: true,
       });
 
-      console.log("Enqueued discovered URL:", {
+      logger.info("discovered_url_enqueued", {
         url: normalizedUrl,
         depth: job.data.depth + 1,
       });
@@ -327,14 +350,19 @@ const worker = new Worker(
 );
 
 worker.on("completed", (job) => {
-  console.log("Job completed:", job.id);
+  logger.info("job_completed", {
+    jobId: job.id,
+  });
 });
 
 worker.on("failed", (job, error) => {
-  console.error("Job failed:", job?.id, error.message);
+  logger.error("job_failed", {
+    jobId: job?.id,
+    error: error.message,
+  });
 });
 
-console.log("Crawler worker started");
+logger.info("worker_started");
 
 let isShuttingDown = false;
 
@@ -344,13 +372,15 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   }
 
   isShuttingDown = true;
-  console.log(`Received ${signal}. Starting graceful shutdown...`);
+  logger.info("shutdown_started", { signal });
 
   try {
     await worker.close();
-    console.log("Worker closed.");
+    logger.info("worker_closed");
   } catch (error) {
-    console.error("Error closing worker:", error);
+    logger.error("worker_close_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
     process.exitCode = 1;
   }
 
@@ -361,21 +391,25 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
       closeRateLimitRedis(),
       closeRobotsRedis(),
     ]);
-    console.log("Redis connections and queues closed.");
+    logger.info("redis_connections_closed");
   } catch (error) {
-    console.error("Error closing Redis queues:", error);
+    logger.error("redis_cleanup_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
     process.exitCode = 1;
   }
 
   try {
     await prisma.$disconnect();
-    console.log("Database connection closed.");
+    logger.info("database_connection_closed");
   } catch (error) {
-    console.error("Error disconnecting Prisma:", error);
+    logger.error("database_disconnect_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
     process.exitCode = 1;
   }
 
-  console.log("Graceful shutdown complete.");
+  logger.info("shutdown_completed");
 }
 
 process.once("SIGTERM", () => {
