@@ -1,8 +1,8 @@
 <h1 align="center">Distributed Web Crawler</h1>
 
 <p align="center">
-  A horizontally scalable, politeness-aware web crawler built on a Redis job queue and PostgreSQL.<br/>
-  Submit a URL over HTTP, scale out stateless workers, and get a crawl that respects <code>robots.txt</code>, per-domain rate limits, retries, and depth limits.
+  A horizontally scalable web crawler built on a Redis job queue and PostgreSQL, with <code>robots.txt</code> compliance,
+  distributed per-domain rate limiting, retries with a dead-letter queue, structured logs, Prometheus metrics, and graceful shutdown.
 </p>
 
 <p align="center">
@@ -11,9 +11,30 @@
   <img alt="BullMQ" src="https://img.shields.io/badge/Queue-BullMQ-E5352C">
   <img alt="Redis" src="https://img.shields.io/badge/Redis-ioredis-DC382D?logo=redis&logoColor=white">
   <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-Prisma_7-4169E1?logo=postgresql&logoColor=white">
+  <img alt="Prometheus" src="https://img.shields.io/badge/Metrics-Prometheus-E6522C?logo=prometheus&logoColor=white">
 </p>
 
----
+<!-- ADD IMAGE: hero demo -->
+<p align="center">
+  <img src="docs/images/demo.gif"
+       alt="Submitting a crawl and watching workers process it"
+       width="800">
+</p>
+
+## Contents
+
+- [Why this project](#why-this-project)
+- [Architecture](#architecture)
+- [Key design decisions](#key-design-decisions)
+- [Features](#features)
+- [Quickstart](#quickstart)
+- [API reference](#api-reference)
+- [Observability](#observability)
+- [Graceful shutdown](#graceful-shutdown)
+- [Configuration](#configuration)
+- [Project structure](#project-structure)
+- [Operational notes](#operational-notes)
+- [License](#license)
 
 ## Why this project
 
@@ -22,11 +43,8 @@ Crawling looks simple until several workers hit the same sites at once. This pro
 - **Correctness under concurrency:** URL deduplication and crawl-completion detection that stay consistent when many workers run in parallel.
 - **Being a good citizen:** `robots.txt` enforcement and rate limiting that are shared across all workers, not per process.
 - **Failure handling:** transient vs. permanent error classification, bounded retries with exponential backoff, and a dead-letter queue.
+- **Operability:** structured JSON logs, Prometheus metrics for throughput, latency, errors and queue depth, and a worker that shuts down cleanly on `SIGTERM`.
 - **Clean service boundaries:** a thin HTTP API that only validates and enqueues, and stateless workers that do the heavy lifting.
-
-## Project status
-
-Working MVP. The core crawl pipeline is implemented end to end: queueing, deduplication, depth-limited recursion, `robots.txt`, per-domain rate limiting, retries, a dead-letter queue, and a status API. It has not yet been hardened for untrusted input or production deployment. The main gaps are SSRF protection, request timeouts, and graceful shutdown; see [Planned work](#planned-work).
 
 ## Architecture
 
@@ -123,7 +141,7 @@ sequenceDiagram
     A->>A: validate input, normalize URL
     A->>P: INSERT Crawl (PENDING)
     A->>R: enqueue seed job (depth 0)
-    A-->>C: 201 {crawlId}
+    A-->>C: 201 {crawlId, status}
 
     W->>R: pull job
     W->>P: Crawl PENDING → RUNNING
@@ -136,6 +154,7 @@ sequenceDiagram
     end
     W->>R: claim per-domain rate-limit slot
     W->>S: GET page
+    Note over W: record HTTP latency and outcome metrics
 
     alt fetch succeeded
         W->>P: upsert Page (status, title, body)
@@ -150,7 +169,7 @@ sequenceDiagram
         W->>P: Url → FAILED
         W->>R: push to crawlDLQ
     end
-    W->>P: if no URLs pending, finalize Crawl
+    W->>P: if no URLs unfinished, finalize Crawl
 ```
 
 ### Status lifecycles
@@ -216,72 +235,139 @@ erDiagram
 | **Deduplication** | URLs are normalized (lowercased host, default ports and fragments stripped, trailing slash trimmed) and protected by a `UNIQUE (crawlId, normalizedUrl)` constraint. A unique-violation (`P2002`) is treated as "already seen", so concurrent workers can't double-crawl a page. |
 | **Race-free completion** | URL registration and the "is this crawl finished?" check both take a row lock on the crawl (`SELECT … FOR UPDATE`) inside a transaction. A crawl that is already `COMPLETED`/`FAILED` rejects new URLs. |
 | **Distributed politeness** | `robots.txt` rules are cached in Redis for an hour and shared by all workers. Rate limiting claims per-domain slots in Redis (`SET NX EX 1`), so the limit holds across worker processes. The default is 1 request/second/domain, configurable per domain. |
-| **Failure handling** | Errors are classified as transient (HTTP 408/429/5xx, `ECONNRESET`, `ETIMEDOUT`, `EAI_AGAIN`, …) or permanent. Transient errors retry up to 3 attempts with exponential backoff. Permanent errors and exhausted retries fail fast via BullMQ's `UnrecoverableError` and are recorded in a dead-letter queue. |
+| **Failure handling** | Errors are classified as transient (HTTP 408/429/5xx, `ECONNRESET`, `ETIMEDOUT`, `EAI_AGAIN`, …) or permanent. Transient errors retry up to 3 attempts with exponential backoff starting at 1s. Permanent errors and exhausted retries fail fast via BullMQ's `UnrecoverableError` and are recorded in a dead-letter queue with the job, URL, attempt count and error. |
 | **No double registration** | Child URLs are registered by the parent before being enqueued and carry a `registered: true` flag, so the child job doesn't re-register itself. Seed jobs are registered by the worker. |
 | **Idempotent writes** | Pages are saved with an upsert keyed on the URL, so a retried job overwrites rather than duplicates. |
+| **Observability** | Workers emit one JSON log line per event and expose Prometheus metrics over HTTP, so crawls can be traced in logs and graphed for throughput, latency, error rate and backlog. |
+| **Clean lifecycle** | Workers handle `SIGTERM`/`SIGINT` and close the queue consumer, metrics server, Redis clients and database connection in order, which fits container and orchestrator restarts. |
 | **Separation of concerns** | The API only validates, persists the crawl, and enqueues. All network I/O happens in workers, which are stateless and scale by adding processes. |
 
 ## Features
 
 - Create and track crawls over HTTP (`POST /crawl`, `GET /crawl/:id`)
 - Depth-limited recursive crawling (`maxDepth: 0` crawls only the start page)
+- URL normalization with persistent, race-safe deduplication
 - `robots.txt` enforcement with the user agent `DistributedWebCrawler/1.0`
 - Per-domain rate limiting shared across workers
-- Retry strategy with transient/permanent error classification
+- Retry strategy with transient/permanent error classification and exponential backoff
 - Dead-letter queue (`crawlDLQ`) for terminally failed URLs
 - Persistent storage of fetched pages (status code, title, content type, body)
-- Cheerio-based HTML parsing and link extraction
+- Structured JSON worker logs
+- Prometheus metrics: pages, failures, HTTP outcomes and latency, job duration, queue depth, plus Node.js runtime metrics
+- Graceful worker shutdown
 
 ## Quickstart
 
-Prerequisites: Node.js, PostgreSQL, and Redis. The repo doesn't ship a Docker Compose file; these two commands are an optional way to get both running locally:
+**Prerequisites:** Node.js 24.x (developed and verified on 24.x), npm, Docker, Git.
 
-```bash
-docker run -d --name crawler-pg -p 5432:5432 \
-  -e POSTGRES_USER=crawler -e POSTGRES_PASSWORD=your_password -e POSTGRES_DB=crawler postgres:16
-docker run -d --name crawler-redis -p 6379:6379 redis:7
-```
-
-Clone and start the API (this also applies the database migration):
+**1. Clone**
 
 ```bash
 git clone https://github.com/Pratyush1110/distributed-web-crawler.git
 cd distributed-web-crawler
-git checkout mvp/basic-crawler
-
-cd api
-npm install
-cp .env.example .env
-npx prisma migrate deploy --config prisma7.config.ts
-npx prisma generate --config prisma7.config.ts
-npm run dev                       # http://127.0.0.1:3000
 ```
 
-In a second terminal, start a worker (start more for more throughput):
+**2. Start Redis and PostgreSQL**
 
 ```bash
-cd worker
+docker run -d --name crawler-redis -p 6379:6379 redis:7
+docker run -d --name crawler-postgres -e POSTGRES_USER=crawler -e POSTGRES_PASSWORD=your_password -e POSTGRES_DB=crawler -p 5432:5432 postgres:17
+```
+
+Use your own local password in place of `your_password`. If the containers already exist, run `docker start crawler-redis crawler-postgres` instead. To check that both are up:
+
+```bash
+docker exec crawler-redis redis-cli ping                       # PONG
+docker exec crawler-postgres pg_isready -U crawler -d crawler  # accepting connections
+```
+
+**3. Configure environment**
+
+Copy each service's example file (`cp .env.example .env`, or `copy .env.example .env` in Windows CMD):
+
+```bash
+cp api/.env.example api/.env
+cp worker/.env.example worker/.env
+```
+
+Then make sure both files contain the values below. `worker/.env.example` does not list `DATABASE_URL` or `METRICS_PORT`, so add them to `worker/.env`:
+
+```dotenv
+DATABASE_URL="postgresql://crawler:your_password@localhost:5432/crawler"
+REDIS_HOST=localhost
+REDIS_PORT=6379
+METRICS_PORT=9464   # worker only
+```
+
+**4. Install dependencies, migrate, and generate the Prisma client**
+
+```bash
+cd api
 npm install
-cp .env.example .env              # then add DATABASE_URL, same value as the API
-npx prisma generate --config prisma7.config.ts
+npx prisma migrate deploy
+npx prisma generate
+
+cd ../worker
+npm install
+npx prisma generate
+cd ..
+```
+
+**5. Run the API and a worker** (separate terminals)
+
+```bash
+# Terminal A: API on http://127.0.0.1:3000
+cd api
 npm run dev
 ```
 
-## Usage
+```bash
+# Terminal B: worker
+cd worker
+npm run build
+npm start
+```
 
-Start a crawl:
+The worker should log `metrics_server_started` and `worker_started`. Start more workers in additional terminals to process the queue in parallel.
+
+**6. Submit a crawl**
 
 ```bash
 curl -X POST http://127.0.0.1:3000/crawl \
   -H "Content-Type: application/json" \
-  -d '{"startUrl": "https://example.com", "maxDepth": 2}'
+  -d '{"startUrl": "https://example.com/", "maxDepth": 0}'
 ```
+
+On Windows CMD, use `curl.exe` and escape the quotes:
+
+```cmd
+curl.exe -X POST http://127.0.0.1:3000/crawl -H "Content-Type: application/json" -d "{\"startUrl\":\"https://example.com/\",\"maxDepth\":0}"
+```
+
+In the worker terminal you should see `job_received`, `url_fetched`, `page_saved` and `job_completed`.
+
+## API reference
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Liveness check, returns `{"status":"ok"}` |
+| `POST` | `/crawl` | Start a crawl |
+| `GET` | `/crawl/:id` | Crawl status and progress counts |
+
+### `POST /crawl`
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `startUrl` | string | Must be a valid `http` or `https` URL |
+| `maxDepth` | integer | ≥ 0. `0` crawls only the start page |
 
 ```json
-{ "crawlId": "<uuid>", "status": "PENDING" }
+{ "crawlId": "366fead8-073c-4d3c-94ac-b3cb30fcee10", "status": "PENDING" }
 ```
 
-Check progress:
+Returns `201` on success (the ID above is illustrative). Invalid input returns `400` with an `error` message, for example `{"error": "startUrl must be a string"}`.
+
+### `GET /crawl/:id`
 
 ```bash
 curl http://127.0.0.1:3000/crawl/<crawlId>
@@ -289,7 +375,7 @@ curl http://127.0.0.1:3000/crawl/<crawlId>
 
 ```json
 {
-  "crawlId": "<uuid>",
+  "crawlId": "366fead8-073c-4d3c-94ac-b3cb30fcee10",
   "status": "running",
   "pagesCrawled": 12,
   "pagesQueued": 4,
@@ -297,81 +383,123 @@ curl http://127.0.0.1:3000/crawl/<crawlId>
 }
 ```
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/health` | Liveness check |
-| `POST` | `/crawl` | Start a crawl. `startUrl` must be `http`/`https`; `maxDepth` must be an integer ≥ 0. Invalid input returns `400`. |
-| `GET` | `/crawl/:id` | Status (`pending`, `running`, `completed`, `failed`) plus crawled/queued/failed counts. Unknown IDs return `404`. |
+`status` is one of `pending`, `running`, `completed`, `failed`. A crawl finishes as `failed` if at least one URL ended in `FAILED` (including URLs blocked by `robots.txt`). Unknown IDs return `404`.
 
-Progress counts are read from PostgreSQL at request time while workers keep writing, so they are eventually consistent: a response is a snapshot and can lag in-flight work. `pagesQueued` counts URLs that are registered but not yet picked up (`PENDING`), not URLs currently being fetched.
+Counts are read from PostgreSQL at request time while workers keep writing, so they are eventually consistent: a response is a snapshot and can lag in-flight work. `pagesQueued` counts URLs that are registered but not yet picked up (`PENDING`), not URLs currently being fetched.
 
-For a production-style worker run:
+## Observability
+
+### Structured logs
+
+Worker logs are single-line JSON with a timestamp, level, event name, and contextual fields, so they can be shipped to any log pipeline and filtered by `event`. Example:
+
+```json
+{"timestamp":"2026-10-20T10:15:32.481Z","level":"info","event":"url_fetched","url":"https://example.com/","statusCode":200,"contentType":"text/html","bodyLength":1256,"latencyMs":143}
+```
+
+Events include `job_received`, `url_fetched`, `page_saved`, `links_extracted`, `discovered_url_enqueued`, `duplicate_url_skipped`, `url_blocked_by_robots`, `url_marked_failed`, `job_moved_to_dlq`, `job_completed`, `job_failed`, and the shutdown events. The API uses Fastify's built-in JSON request logging.
+
+<!-- ADD IMAGE: worker logs -->
+![Structured worker logs](docs/images/worker-logs.png)
+
+### Prometheus metrics
+
+Each worker serves metrics at `http://localhost:9464/metrics` (port set by `METRICS_PORT`).
 
 ```bash
-cd worker
-npm run build && npm start
+curl http://localhost:9464/metrics
 ```
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `crawler_pages_crawled_total` | Counter | Pages successfully saved |
+| `crawler_failures_total` | Counter | Terminal fetch failures |
+| `crawler_http_requests_total{outcome}` | Counter | Fetch attempts, labelled `success` or `error` |
+| `crawler_http_request_duration_seconds` | Histogram | HTTP fetch duration |
+| `crawler_job_duration_seconds` | Histogram | Duration of a single worker job attempt |
+| `crawler_queue_waiting_jobs` | Gauge | Jobs waiting in the crawl queue at scrape time |
+
+Default Node.js process metrics (CPU, memory, garbage collection, event loop) are collected as well.
+
+Example PromQL queries:
+
+```promql
+# Pages per second, 5-minute window
+rate(crawler_pages_crawled_total[5m])
+
+# HTTP error ratio
+sum(rate(crawler_http_requests_total{outcome="error"}[5m]))
+/
+clamp_min(sum(rate(crawler_http_requests_total[5m])), 1e-9)
+
+# p95 HTTP latency
+histogram_quantile(0.95, sum(rate(crawler_http_request_duration_seconds_bucket[5m])) by (le))
+
+# Backlog
+crawler_queue_waiting_jobs
+```
+
+<!-- ADD IMAGE: metrics -->
+![Prometheus metrics endpoint](docs/images/metrics.png)
+
+## Graceful shutdown
+
+On `SIGTERM` or `SIGINT`, the worker stops taking new jobs and releases its resources in order. Each stage is logged, and a failure in any stage sets a non-zero exit code.
+
+```mermaid
+flowchart LR
+    S["SIGTERM / SIGINT"] --> W["Close BullMQ worker<br/>(stop taking jobs, let the in-flight job finish)"]
+    W --> M["Close metrics server"]
+    M --> R["Close queues and Redis clients<br/>(crawlQueue, crawlDLQ, rate limiter, robots cache)"]
+    R --> D["Disconnect Prisma"]
+    D --> X["shutdown_completed"]
+```
+
+Try it by pressing `Ctrl+C` in the worker terminal and watching the shutdown events.
 
 ## Configuration
 
-Each service reads its own `.env` file.
+Each service reads its own `.env` file. Never commit real `.env` files or credentials.
 
 | Variable | Used by | Description | Default |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | api, worker | PostgreSQL connection string, e.g. `postgresql://crawler:your_password@localhost:5432/crawler` | required |
+| `DATABASE_URL` | api, worker | PostgreSQL connection string | required |
 | `REDIS_HOST` | api, worker | Redis host (queues, rate limiter, robots cache) | `localhost` |
 | `REDIS_PORT` | api, worker | Redis port | `6379` |
+| `METRICS_PORT` | worker | Port for the `/metrics` HTTP server | `9464` |
 | `DOMAIN_RATE_LIMITS` | worker | Per-domain requests per second as `domain:rate,domain:rate`, e.g. `example.com:2,example.org:5` | `1` per domain |
+
+The API listens on `127.0.0.1:3000`; host and port are set in `api/src/server.ts`.
 
 ## Project structure
 
-```
-api/       Fastify server, Prisma schema and migrations, BullMQ producer
-worker/    BullMQ worker: robots.txt, rate limiting, fetch, retry, DLQ, link discovery
-```
-
-## Planned work
-
-Current limitations and what's next, grouped by area.
-
-**Reliability**
-- [ ] Graceful shutdown: on `SIGTERM`, stop taking jobs, finish the current one, then close Redis and PostgreSQL connections (workers currently have no signal handling)
-- [ ] Request timeouts and a maximum response size in the fetcher (neither is enforced today)
-- [ ] Explicit job IDs for idempotent enqueueing
-- [ ] Honor `Retry-After` on HTTP 429 (parsed into `HttpError`, not yet used for backoff)
-- [ ] Configurable worker concurrency (workers use BullMQ's default of one job at a time)
-- [ ] Write failure details to the `CrawlError` table (the model exists but isn't populated)
-- [ ] Documented failure tests: killed workers, Redis outage, slow or timing-out sites, duplicate crawl submissions
-
-**Observability**
-- [ ] Structured JSON logging (currently `console.log`)
-- [ ] Metrics: pages crawled, failures, queue depth, crawl latency, HTTP error rate, worker throughput
-
-**Security**
-- [ ] SSRF protection: the API accepts any `http`/`https` URL, so private, loopback, and link-local addresses (and redirects to them) must be blocked before this runs on untrusted input
-- [ ] API authentication and rate limiting
-- [ ] Upper bound on `maxDepth`
-
-**Features**
-- [ ] Search over crawled pages (PostgreSQL full-text search first)
-- [ ] Endpoint to read crawled pages
-- [ ] Content-type filtering so non-HTML responses aren't parsed as HTML
-- [ ] DLQ inspection and replay tooling
-
-**Deployment and quality**
-- [ ] Dockerfiles for the API and worker, plus Docker Compose for one-command startup
-- [ ] Load test with multiple workers against a large crawl
-- [ ] Automated tests: unit tests for URL normalization, robots parsing, and retry classification; integration tests for the crawl lifecycle
-
-## Development
-
-```bash
-npm run dev      # tsx watch (api, worker)
-npm run build    # tsc type-check and compile (api, worker)
+```text
+distributed-web-crawler/
+├── api/
+│   ├── prisma/              schema and migrations
+│   └── src/
+│       ├── server.ts        Fastify routes
+│       └── lib/             prisma client, queue producer, URL normalization
+└── worker/
+    ├── prisma/              schema (kept in sync with the API)
+    └── src/
+        ├── worker.ts        job processor and shutdown handling
+        └── lib/
+            ├── http.ts, html.ts, links.ts, discovery.ts      fetch, parse, discover
+            ├── robots.ts, robots-parser.ts, rate-limit.ts    crawl policies
+            ├── retry.ts, dlq.ts, queue.ts                    failure handling
+            ├── url.ts, crawl.ts, crawl-status.ts             registration, depth, completion
+            └── logger.ts, metrics.ts, metrics-server.ts      observability
 ```
 
-After changing `prisma/schema.prisma`, run `npx prisma generate --config prisma7.config.ts` in both services, and keep the two schema files in sync. Migrations live in `api/`.
+## Operational notes
+
+- **Scope:** built for local and trusted internal use. The API has no authentication and the crawler fetches any `http`/`https` URL it is given, so don't expose it to untrusted users or the public internet.
+- Failed jobs are retained in BullMQ (last 500) and completed jobs (last 100); terminally failed URLs are also pushed to `crawlDLQ`.
+- Metrics are held in process memory and reset when a worker restarts. Each worker serves its own metrics, so scrape every worker.
+- `crawler_queue_waiting_jobs` reports waiting jobs only, not active or delayed jobs.
+- `crawler_failures_total` counts terminal fetch failures. The `outcome="error"` label counts any exception from the fetch call, covering both HTTP error statuses and network errors.
 
 ## License
 
-Both `package.json` files declare `ISC`; a `LICENSE` file is not yet in the repository.
+ISC, as declared in the package manifests.
